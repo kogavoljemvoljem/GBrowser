@@ -1,4 +1,4 @@
-# Gorstak's Browser - PyQt6 version with fixed bookmarks parser
+# Gorstak's Browser - PyQt6 with tabs, video support, and fixed bookmarks
 import os
 import sys
 import re
@@ -12,52 +12,141 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--no-sandbox "
-    "--disable-blink-features=AutomationControlled "
-    "--disable-features=WebRtcHideLocalIpsWithMdns,IsolateOrigins,site-per-process "
-    "--enable-features=WebRTCPipeWireCapturer,NetworkService,NetworkServiceInProcess "
     "--enable-accelerated-2d-canvas "
     "--enable-gpu-rasterization "
     "--enable-webgl "
     "--enable-webgl2 "
     "--ignore-gpu-blocklist "
     "--autoplay-policy=no-user-gesture-required "
-    "--disable-site-isolation-trials "
-    "--enable-javascript-harmony "
-    "--disable-ipc-flooding-protection "
-    "--disable-renderer-backgrounding "
-    "--disable-backgrounding-occluded-windows "
-    "--force-color-profile=srgb "
+    # Video codec support
+    "--enable-accelerated-video-decode "
+    "--enable-accelerated-video-encode "
+    "--enable-gpu-memory-buffer-video-frames "
+    "--enable-native-gpu-memory-buffers "
+    "--disable-webrtc-multiple-routes "
+    "--disable-webrtc-hw-encoding "
+    "--disable-webrtc-hw-decoding "
+    "--enforce-webrtc-ip-permission-check "
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp "
+    "--disable-background-networking "
+    "--disable-client-side-phishing-detection "
+    "--no-pings "
+    "--disable-domain-reliability "
 )
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QToolButton, QMenu, QFileDialog,
-    QMessageBox, QSizePolicy
+    QMessageBox, QSizePolicy, QTabWidget, QTabBar
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
-    QWebEnginePage, QWebEngineProfile, QWebEngineScript, QWebEngineSettings
+    QWebEnginePage, QWebEngineProfile, QWebEngineScript, QWebEngineSettings,
+    QWebEngineUrlRequestInterceptor  # Added for ad blocking
 )
 from PyQt6.QtCore import Qt, QUrl, QSize, QTimer, QByteArray
 from PyQt6.QtGui import QFont, QPixmap, QPainter, QIcon, QAction
 from PyQt6.QtSvg import QSvgRenderer
 from bs4 import BeautifulSoup
 
+
+AD_DOMAINS = {
+    # Major ad networks
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+    "google-analytics.com", "googletagmanager.com", "googletagservices.com",
+    "adservice.google.com", "pagead2.googlesyndication.com",
+    # Facebook tracking
+    "facebook.net", "fbcdn.net", "connect.facebook.net",
+    "pixel.facebook.com", "an.facebook.com",
+    # Other ad networks
+    "adsrvr.org", "adnxs.com", "rubiconproject.com", "pubmatic.com",
+    "openx.net", "casalemedia.com", "criteo.com", "criteo.net",
+    "outbrain.com", "taboola.com", "mgid.com", "revcontent.com",
+    "amazon-adsystem.com", "media.net", "contextweb.com",
+    "advertising.com", "adcolony.com", "unity3d.com", "applovin.com",
+    "mopub.com", "inmobi.com", "chartboost.com",
+    # Tracking/Analytics
+    "scorecardresearch.com", "quantserve.com", "hotjar.com",
+    "fullstory.com", "mouseflow.com", "crazyegg.com", "luckyorange.com",
+    "mixpanel.com", "amplitude.com", "segment.io", "segment.com",
+    "branch.io", "adjust.com", "appsflyer.com", "kochava.com",
+    "newrelic.com", "nr-data.net", "bugsnag.com", "sentry.io",
+    "rollbar.com", "raygun.com",
+    # Social tracking
+    "addthis.com", "sharethis.com", "addtoany.com",
+    "twitter.com/i/adsct", "analytics.twitter.com",
+    "linkedin.com/px", "snap.licdn.com",
+    "tiktok.com/i18n/pixel", "analytics.tiktok.com",
+    # Misc trackers
+    "omtrdc.net", "demdex.net", "everesttech.net",  # Adobe
+    "bing.com/bat.js", "bat.bing.com",  # Microsoft
+    "yandex.ru/metrika", "mc.yandex.ru",  # Yandex
+    "gemius.pl", "hit.gemius.pl",
+    "2mdn.net", "serving-sys.com", "eyeota.net", "bluekai.com",
+    "exelator.com", "crwdcntrl.net", "rlcdn.com", "pippio.com",
+    "tapad.com", "adform.net", "adsymptotic.com", "adgrx.com",
+    # Popup/overlay annoyances
+    "pushwoosh.com", "onesignal.com", "pusher.com", "subscribers.com",
+    "popads.net", "popcash.net", "propellerads.com",
+}
+
+AD_URL_PATTERNS = [
+    r"/ads/", r"/ad/", r"/adserver", r"/advert", r"/banner",
+    r"doubleclick", r"googlesyndication", r"googleads",
+    r"/pagead/", r"/pixel", r"/tracking", r"/tracker",
+    r"amazon-adsystem", r"/sponsored", r"smartadserver",
+]
+
+
+class AdBlocker(QWebEngineUrlRequestInterceptor):
+    """Request interceptor to block ads and trackers"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.blocked_count = 0
+        self.enabled = True
+    
+    def interceptRequest(self, info):
+        if not self.enabled:
+            return
+            
+        url = info.requestUrl().toString().lower()
+        host = info.requestUrl().host().lower()
+        
+        # Check if host matches any ad domain
+        for ad_domain in AD_DOMAINS:
+            if host == ad_domain or host.endswith("." + ad_domain):
+                info.block(True)
+                self.blocked_count += 1
+                return
+        
+        # Check URL patterns
+        for pattern in AD_URL_PATTERNS:
+            if re.search(pattern, url, re.IGNORECASE):
+                info.block(True)
+                self.blocked_count += 1
+                return
+
+
 # Small SVG helpers
 OVERFLOW_SVG = '<svg width="20" height="20"><path d="M6 10c0-1.1.9-2 2-2s2 .9 2 2-.9 2-2 2-2-.9-2-2z" fill="#ccc"/></svg>'
+NEW_TAB_SVG = '<svg width="20" height="20"><path d="M10 4v6h6v2h-6v6H8v-6H2v-2h6V4h2z" fill="#ccc"/></svg>'
+CLOSE_SVG = '<svg width="12" height="12"><path d="M2 2l8 8M10 2l-8 8" stroke="#ccc" stroke-width="2"/></svg>'
 
 def svg_icon(svg, size=20):
     r = QSvgRenderer(QByteArray(svg.encode()))
     pix = QPixmap(size, size)
-    pix.fill(Qt.GlobalColor.transparent)  # PyQt6 enum
+    pix.fill(Qt.GlobalColor.transparent)
     p = QPainter(pix)
     r.render(p)
     p.end()
     return QIcon(pix)
 
+
 class CustomWebPage(QWebEnginePage):
-    def __init__(self, profile, parent=None):
+    def __init__(self, profile, parent=None, browser=None):
         super().__init__(profile, parent)
+        self._browser = browser
         
         settings = self.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
@@ -75,17 +164,9 @@ class CustomWebPage(QWebEnginePage):
         settings.setAttribute(QWebEngineSettings.WebAttribute.AllowWindowActivationFromJavaScript, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.ErrorPageEnabled, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.FocusOnNavigationEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.HyperlinkAuditingEnabled, False)
         
         self.featurePermissionRequested.connect(self._handle_permission_request)
-    
-    def javaScriptConsoleMessage(self, level, message, line, source):
-        """Print JavaScript console messages for debugging"""
-        level_names = {
-            QWebEnginePage.JavaScriptConsoleMessageLevel.InfoMessageLevel: "INFO",
-            QWebEnginePage.JavaScriptConsoleMessageLevel.WarningMessageLevel: "WARN",
-            QWebEnginePage.JavaScriptConsoleMessageLevel.ErrorMessageLevel: "ERROR"
-        }
-        print(f"[JS {level_names.get(level, 'LOG')}] {source}:{line} - {message}")
     
     def _handle_permission_request(self, url, feature):
         self.setFeaturePermission(url, feature, QWebEnginePage.PermissionPolicy.PermissionGrantedByUser)
@@ -94,7 +175,19 @@ class CustomWebPage(QWebEnginePage):
         return True
     
     def createWindow(self, window_type):
-        return self
+        if self._browser:
+            return self._browser.create_new_tab()
+        return None
+
+
+class BrowserTab(QWebEngineView):
+    def __init__(self, profile, browser, url=None):
+        super().__init__()
+        self._browser = browser
+        page = CustomWebPage(profile, self, browser)
+        self.setPage(page)
+        if url:
+            self.setUrl(QUrl(url))
 
 
 class Browser(QMainWindow):
@@ -102,11 +195,10 @@ class Browser(QMainWindow):
         super().__init__()
         self.setWindowTitle("Gorstak's Browser")
         self.setMinimumSize(800, 600)
-        self.setWindowFlags(Qt.WindowType.Window)  # PyQt6 enum
+        self.setWindowFlags(Qt.WindowType.Window)
 
         self.config = self._load_config()
         
-        # Apply saved window geometry
         geom = self.config.get("geometry", {})
         self.setGeometry(
             geom.get("x", 100),
@@ -124,7 +216,6 @@ class Browser(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Top nav
         nav = QWidget()
         nav.setFixedHeight(64)
         nav.setStyleSheet("background:#252526;")
@@ -136,202 +227,52 @@ class Browser(QMainWindow):
         self.profile.setPersistentStoragePath(os.path.join(CONFIG_DIR, "storage"))
         self.profile.setCachePath(os.path.join(CONFIG_DIR, "cache"))
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-        self.profile.setHttpUserAgent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.0.0 Safari/537.36"
-        )
         
-        script = QWebEngineScript()
-        script.setName("antibot")
-        script.setSourceCode("""
-            (function() {
-                'use strict';
-                
-                // Core webdriver hiding
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                
-                // Delete automation indicators
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-                
-                // Realistic navigator properties
-                const nav = {
-                    plugins: (function() {
-                        const plugins = [
-                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-                        ];
-                        plugins.item = i => plugins[i];
-                        plugins.namedItem = name => plugins.find(p => p.name === name);
-                        plugins.refresh = () => {};
-                        return plugins;
-                    })(),
-                    languages: ['en-US', 'en'],
-                    language: 'en-US',
-                    platform: 'Win32',
-                    vendor: 'Google Inc.',
-                    hardwareConcurrency: 8,
-                    deviceMemory: 8,
-                    maxTouchPoints: 0,
-                    cookieEnabled: true,
-                    doNotTrack: null,
-                    appCodeName: 'Mozilla',
-                    appName: 'Netscape',
-                    appVersion: '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-                    product: 'Gecko',
-                    productSub: '20030107',
-                    vendorSub: ''
-                };
-                
-                for (const [key, value] of Object.entries(nav)) {
-                    try {
-                        Object.defineProperty(navigator, key, { get: () => value, configurable: true });
-                    } catch(e) {}
-                }
-                
-                // Chrome object for Discord
-                window.chrome = {
-                    app: { isInstalled: false, InstallState: {DISABLED:'disabled',INSTALLED:'installed',NOT_INSTALLED:'not_installed'}, RunningState: {CANNOT_RUN:'cannot_run',READY_TO_RUN:'ready_to_run',RUNNING:'running'}, getDetails: () => null, getIsInstalled: () => false },
-                    runtime: {
-                        OnInstalledReason: {CHROME_UPDATE:'chrome_update',INSTALL:'install',SHARED_MODULE_UPDATE:'shared_module_update',UPDATE:'update'},
-                        OnRestartRequiredReason: {APP_UPDATE:'app_update',OS_UPDATE:'os_update',PERIODIC:'periodic'},
-                        PlatformArch: {ARM:'arm',ARM64:'arm64',MIPS:'mips',MIPS64:'mips64',X86_32:'x86-32',X86_64:'x86-64'},
-                        PlatformNaclArch: {ARM:'arm',MIPS:'mips',MIPS64:'mips64',X86_32:'x86-32',X86_64:'x86-64'},
-                        PlatformOs: {ANDROID:'android',CROS:'cros',LINUX:'linux',MAC:'mac',OPENBSD:'openbsd',WIN:'win'},
-                        RequestUpdateCheckStatus: {NO_UPDATE:'no_update',THROTTLED:'throttled',UPDATE_AVAILABLE:'update_available'},
-                        connect: () => ({ onDisconnect:{addListener:()=>{}}, onMessage:{addListener:()=>{}}, postMessage:()=>{} }),
-                        sendMessage: () => {},
-                        id: undefined,
-                        getManifest: () => ({}),
-                        getURL: (path) => path,
-                        getPlatformInfo: (cb) => cb && cb({os: 'win', arch: 'x86-64', nacl_arch: 'x86-64'})
-                    },
-                    csi: () => ({ pageT: Date.now(), startE: Date.now(), onloadT: Date.now() }),
-                    loadTimes: () => ({
-                        commitLoadTime: Date.now()/1000, connectionInfo:'h2', finishDocumentLoadTime: Date.now()/1000,
-                        finishLoadTime: Date.now()/1000, firstPaintAfterLoadTime:0, firstPaintTime: Date.now()/1000,
-                        navigationType:'navigate', npnNegotiatedProtocol:'h2', requestTime: Date.now()/1000,
-                        startLoadTime: Date.now()/1000, wasAlternateProtocolAvailable:false, wasFetchedViaSpdy:true, wasNpnNegotiated:true
-                    })
-                };
-                
-                // WebGL spoofing
-                const spoofWebGL = (ctx) => {
-                    if (!ctx) return;
-                    const orig = ctx.prototype.getParameter;
-                    ctx.prototype.getParameter = function(p) {
-                        if (p === 37445) return 'Google Inc. (NVIDIA)';
-                        if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-                        if (p === 7936) return 'WebKit';
-                        if (p === 7937) return 'WebKit WebGL';
-                        return orig.call(this, p);
-                    };
-                };
-                spoofWebGL(WebGLRenderingContext);
-                if (typeof WebGL2RenderingContext !== 'undefined') spoofWebGL(WebGL2RenderingContext);
-                
-                // Canvas fingerprint protection
-                const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-                HTMLCanvasElement.prototype.toDataURL = function(type) {
-                    const ctx = this.getContext('2d');
-                    if (ctx) {
-                        const imgData = ctx.getImageData(0, 0, this.width, this.height);
-                        for (let i = 0; i < imgData.data.length; i += 4) {
-                            imgData.data[i] ^= 1;
-                        }
-                        ctx.putImageData(imgData, 0, 0);
-                    }
-                    return origToDataURL.apply(this, arguments);
-                };
-                
-                // Permissions API fix
-                if (navigator.permissions) {
-                    const origQuery = navigator.permissions.query;
-                    navigator.permissions.query = (params) => {
-                        if (params.name === 'notifications') {
-                            return Promise.resolve({ state: Notification.permission || 'prompt', onchange: null });
-                        }
-                        return origQuery.call(navigator.permissions, params);
-                    };
-                }
-                
-                // Screen properties
-                Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
-                Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
-                
-                // AudioContext fingerprint protection
-                if (window.AudioContext || window.webkitAudioContext) {
-                    const AC = window.AudioContext || window.webkitAudioContext;
-                    const origCreateAnalyser = AC.prototype.createAnalyser;
-                    AC.prototype.createAnalyser = function() {
-                        const analyser = origCreateAnalyser.call(this);
-                        const origGetFloatFrequencyData = analyser.getFloatFrequencyData;
-                        analyser.getFloatFrequencyData = function(array) {
-                            origGetFloatFrequencyData.call(this, array);
-                            for (let i = 0; i < array.length; i++) {
-                                array[i] += Math.random() * 0.0001;
-                            }
-                        };
-                        return analyser;
-                    };
-                }
-                
-                // Connection API
-                Object.defineProperty(navigator, 'connection', {
-                    get: () => ({
-                        effectiveType: '4g',
-                        rtt: 50,
-                        downlink: 10,
-                        saveData: false,
-                        onchange: null,
-                        addEventListener: () => {},
-                        removeEventListener: () => {}
-                    })
-                });
-                
-                // Cloudflare Turnstile iframe fix
-                const enableIframeClicks = () => {
-                    document.querySelectorAll('iframe').forEach(iframe => {
-                        iframe.style.pointerEvents = 'auto';
-                        try {
-                            const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-                            if (iframeDoc) {
-                                iframeDoc.body.style.pointerEvents = 'auto';
-                            }
-                        } catch(e) {}
-                    });
-                };
-                
-                setInterval(enableIframeClicks, 500);
-                document.addEventListener('DOMContentLoaded', enableIframeClicks);
-                
-                console.log('[GBrowser] Anti-detection script loaded successfully');
-            })();
+        self.ad_blocker = AdBlocker(self)
+        self.profile.setUrlRequestInterceptor(self.ad_blocker)
+        
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 0; }
+            QTabBar::tab {
+                background: #2d2d2d;
+                color: #ccc;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                min-width: 120px;
+                max-width: 200px;
+            }
+            QTabBar::tab:selected {
+                background: #3c3c3c;
+                color: white;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #353535;
+            }
+            QTabBar::close-button {
+                image: none;
+                subcontrol-position: right;
+            }
         """)
-        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        script.setRunsOnSubFrames(True)
-        self.profile.scripts().insert(script)
-
-        self.browser = QWebEngineView()
-        page = CustomWebPage(self.profile, self.browser)
-        self.browser.setPage(page)
         
         last_url = self.config.get("last_url", "https://www.google.com")
-        self.browser.setUrl(QUrl(last_url))
+        self._add_tab(last_url)
 
-        # Nav icons
         back_svg = '<svg width="24" height="24"><path d="M20 11 H7.83 l5.59-5.59 L12 4 l-8 8 8 8 1.41-1.41 L7.83 13 H20 v-2 z" fill="#ccc"/></svg>'
         forward_svg = '<svg width="24" height="24"><path d="M12 4 l-1.41 1.41 L16.17 11 H4 v2 h12.17 l-5.58 5.59 L12 20 l8-8 z" fill="#ccc"/></svg>'
         reload_svg = '<svg width="24" height="24"><path d="M17.65 6.35 C16.2 4.9 14.21 4 12 4 c-4.42 0-7.99 3.58-7.99 8 s3.57 8 7.99 8 c3.73 0 6.84-2.55 7.73-6 h-2.08 c-.82 2.33-3.04 4-5.65 4 -3.31 0-6-2.69-6-6 s2.69-6 6-6 c1.66 0 3.14.69 4.22 1.78 L13 11 h7 V4 l-2.35 2.35 z" fill="#ccc"/></svg>'
         home_svg = '<svg width="24" height="24"><path d="M10 20 v-6 h4 v6 h5 v-8 h3 L12 3 2 12 h3 v8 z" fill="#ccc"/></svg>'
 
         for svg, func in zip([back_svg, forward_svg, reload_svg, home_svg],
-                             [self.browser.back, self.browser.forward, self.browser.reload,
-                              lambda: self.browser.setUrl(QUrl("https://www.google.com"))]):
+                             [self._go_back, self._go_forward, self._reload,
+                              lambda: self._current_browser().setUrl(QUrl("https://www.google.com"))]):
             btn = QPushButton()
             btn.setFixedSize(48, 48)
             btn.setIcon(svg_icon(svg))
@@ -344,6 +285,19 @@ class Browser(QMainWindow):
             btn.clicked.connect(func)
             nlay.addWidget(btn)
 
+        new_tab_btn = QPushButton()
+        new_tab_btn.setFixedSize(48, 48)
+        new_tab_btn.setIcon(svg_icon(NEW_TAB_SVG))
+        new_tab_btn.setIconSize(QSize(24, 24))
+        new_tab_btn.setStyleSheet("""
+            QPushButton { background:#3c3c3c; border-radius:24px; }
+            QPushButton:hover { background:#505050; }
+            QPushButton:pressed { background:#606060; }
+        """)
+        new_tab_btn.setToolTip("New Tab")
+        new_tab_btn.clicked.connect(lambda: self._add_tab("https://www.google.com"))
+        nlay.addWidget(new_tab_btn)
+
         # Bookmarks import button (B)
         self.btnB = QPushButton("B")
         self.btnB.setFixedSize(48, 48)
@@ -354,7 +308,6 @@ class Browser(QMainWindow):
         """)
         self.btnB.clicked.connect(self.open_bookmarks_file)
         nlay.addWidget(self.btnB)
-
 
         # URL bar
         self.url_bar = QLineEdit()
@@ -375,8 +328,7 @@ class Browser(QMainWindow):
         url_lay.addWidget(self.url_bar)
         nlay.addWidget(url_container, 1)
 
-        self.browser.urlChanged.connect(lambda u: self.url_bar.setText(u.toString()))
-        self.browser.page().profile().downloadRequested.connect(self.handle_download)
+        self.profile.downloadRequested.connect(self.handle_download)
 
         layout.addWidget(nav)
 
@@ -406,7 +358,7 @@ class Browser(QMainWindow):
         bb_layout.addWidget(self.overflow_btn)
 
         layout.addWidget(self.bookmarks_bar_widget)
-        layout.addWidget(self.browser, 1)
+        layout.addWidget(self.tabs, 1)
 
         # internal data
         self.bookmarks = []
@@ -420,6 +372,67 @@ class Browser(QMainWindow):
         if saved_bookmarks:
             self.bookmarks = saved_bookmarks
             self._rebuild_bookmarks_bar()
+
+    def _add_tab(self, url="https://www.google.com"):
+        tab = BrowserTab(self.profile, self, url)
+        tab.titleChanged.connect(lambda title, t=tab: self._update_tab_title(t, title))
+        tab.urlChanged.connect(lambda url, t=tab: self._update_url_bar(t, url))
+        idx = self.tabs.addTab(tab, "New Tab")
+        self.tabs.setCurrentIndex(idx)
+        return tab
+    
+    def create_new_tab(self, url=None):
+        """Called by CustomWebPage.createWindow for target=_blank links"""
+        tab = BrowserTab(self.profile, self, url)
+        tab.titleChanged.connect(lambda title, t=tab: self._update_tab_title(t, title))
+        tab.urlChanged.connect(lambda url, t=tab: self._update_url_bar(t, url))
+        idx = self.tabs.addTab(tab, "New Tab")
+        self.tabs.setCurrentIndex(idx)
+        return tab.page()
+    
+    def close_tab(self, index):
+        if self.tabs.count() > 1:
+            widget = self.tabs.widget(index)
+            self.tabs.removeTab(index)
+            widget.deleteLater()
+        else:
+            # Last tab - close window
+            self.close()
+    
+    def _update_tab_title(self, tab, title):
+        idx = self.tabs.indexOf(tab)
+        if idx >= 0:
+            short_title = title[:25] + "..." if len(title) > 25 else title
+            self.tabs.setTabText(idx, short_title or "New Tab")
+    
+    def _update_url_bar(self, tab, url):
+        if tab == self._current_browser():
+            self.url_bar.setText(url.toString())
+    
+    def _on_tab_changed(self, index):
+        if not hasattr(self, 'url_bar'):
+            return
+        browser = self._current_browser()
+        if browser:
+            self.url_bar.setText(browser.url().toString())
+    
+    def _current_browser(self):
+        return self.tabs.currentWidget()
+    
+    def _go_back(self):
+        b = self._current_browser()
+        if b:
+            b.back()
+    
+    def _go_forward(self):
+        b = self._current_browser()
+        if b:
+            b.forward()
+    
+    def _reload(self):
+        b = self._current_browser()
+        if b:
+            b.reload()
 
     def _load_config(self):
         """Load config from file"""
@@ -444,7 +457,9 @@ class Browser(QMainWindow):
             "maximized": self.isMaximized()
         }
         
-        self.config["last_url"] = self.browser.url().toString()
+        browser = self._current_browser()
+        if browser:
+            self.config["last_url"] = browser.url().toString()
         self.config["bookmarks"] = self.bookmarks
         
         try:
@@ -470,17 +485,12 @@ class Browser(QMainWindow):
     def _parse_bookmarks_html(self, html):
         try:
             soup = BeautifulSoup(html, "html5lib")
-            print("[DEBUG] Using html5lib parser")
         except Exception:
             soup = BeautifulSoup(html, "html.parser")
-            print("[DEBUG] Using html.parser (html5lib not available)")
-        
-        print(f"[DEBUG] Found top-level DL: {soup.find('dl') is not None}")
         
         def parse_dl(dl_tag, depth=0):
             """Robust recursive parser for Netscape-style bookmarks HTML."""
             nodes = []
-            indent = "  " * depth
             
             all_dts = dl_tag.find_all("dt")
             direct_dts = []
@@ -490,8 +500,6 @@ class Browser(QMainWindow):
                     parent = parent.parent
                 if parent is dl_tag:
                     direct_dts.append(dt)
-            
-            print(f"[DEBUG] {indent}parse_dl: found {len(direct_dts)} direct DT children")
             
             for dt in direct_dts:
                 a = dt.find("a", recursive=False) or dt.find("a")
@@ -510,7 +518,6 @@ class Browser(QMainWindow):
                     title = (a.get_text(strip=True) or a.get("href") or "").strip()
                     href = a.get("href")
                     if href:
-                        print(f"[DEBUG] {indent}Link: {title[:50]}")
                         nodes.append({"type": "link", "title": title or href, "href": href})
                     continue
 
@@ -522,21 +529,17 @@ class Browser(QMainWindow):
                     while sibling:
                         if hasattr(sibling, 'name'):
                             if sibling.name == "dl":
-                                print(f"[DEBUG] {indent}Folder '{folder_title}' - found sibling DL")
                                 children = parse_dl(sibling, depth + 1)
                                 break
                             elif sibling.name == "dt":
-                                print(f"[DEBUG] {indent}Folder '{folder_title}' - no sibling DL (hit next DT)")
                                 break
                         sibling = sibling.next_sibling
                     
                     if not children:
                         child_dl = dt.find("dl")
                         if child_dl:
-                            print(f"[DEBUG] {indent}Folder '{folder_title}' - found nested DL inside DT")
                             children = parse_dl(child_dl, depth + 1)
                     
-                    print(f"[DEBUG] {indent}Folder: {folder_title}, children: {len(children)}")
                     nodes.append({"type": "folder", "title": folder_title, "children": children})
 
             return nodes
@@ -544,12 +547,9 @@ class Browser(QMainWindow):
         top_dl = soup.find("dl")
         if top_dl:
             parsed = parse_dl(top_dl)
-            print(f"[DEBUG] Total parsed items: {len(parsed)}")
             if len(parsed) == 1 and parsed[0].get("type") == "folder":
-                print(f"[DEBUG] Unwrapping top-level folder: {parsed[0].get('title')}")
                 parsed = parsed[0].get("children", parsed)
         else:
-            print("[DEBUG] No DL structure found, falling back to anchor collection")
             parsed = []
             for a in soup.find_all("a"):
                 href = a.get("href")
@@ -582,14 +582,14 @@ class Browser(QMainWindow):
             label.setStyleSheet("color: #666; padding: 6px 10px;")
             self.bookmarks_container_layout.addWidget(label)
             spacer = QWidget()
-            spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)  # PyQt6 enum
+            spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             self.bookmarks_container_layout.addWidget(spacer)
             return
 
         for node in self.bookmarks:
             if node["type"] == "link":
                 btn = QPushButton(node.get("title", node.get("href", "untitled")))
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)  # PyQt6 enum
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 btn.setProperty("href", node.get("href"))
                 btn.setStyleSheet("""
                     QPushButton { background:#3c3c3c; color:white; border-radius:6px; padding:6px 10px; }
@@ -600,7 +600,7 @@ class Browser(QMainWindow):
             elif node["type"] == "folder":
                 tb = QToolButton()
                 tb.setText(node.get("title", "Folder"))
-                tb.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)  # PyQt6 enum
+                tb.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
                 tb.setStyleSheet("""
                     QToolButton { background:#3c3c3c; color:white; border-radius:6px; padding:6px 10px; }
                     QToolButton:hover { background:#505050; }
@@ -624,7 +624,7 @@ class Browser(QMainWindow):
                 self.bookmarks_container_layout.addWidget(tb)
 
         spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)  # PyQt6 enum
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.bookmarks_container_layout.addWidget(spacer)
         self._overflow_timer.start(120)
 
@@ -636,7 +636,8 @@ class Browser(QMainWindow):
             return
         if not href.startswith(("http://", "https://")):
             href = "https://" + href
-        self.browser.setUrl(QUrl(href))
+        # Open in new tab
+        self._add_tab(href)
 
     # ------------------------
     # Overflow
@@ -655,7 +656,7 @@ class Browser(QMainWindow):
             w = it.widget()
             if w is None:
                 continue
-            if isinstance(w, QWidget) and w.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Expanding:  # PyQt6 enum
+            if isinstance(w, QWidget) and w.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Expanding:
                 break
             w.adjustSize()
             w_w = w.width() if w.width() > 0 else w.sizeHint().width()
@@ -719,7 +720,7 @@ class Browser(QMainWindow):
                 if src_menu:
                     clone_menu(src_menu, sub)
                 menu.addMenu(sub)
-        menu.exec(self.overflow_btn.mapToGlobal(self.overflow_btn.rect().bottomLeft()))  # PyQt6: exec_ -> exec
+        menu.exec(self.overflow_btn.mapToGlobal(self.overflow_btn.rect().bottomLeft()))
 
     def _find_href_by_title(self, title):
         queue = list(self.bookmarks)
@@ -742,29 +743,42 @@ class Browser(QMainWindow):
             url = "https://www.google.com/search?q=" + url.replace(" ", "+")
         elif not url.startswith(("http://", "https://")):
             url = "https://" + url
-        self.browser.setUrl(QUrl(url))
+        browser = self._current_browser()
+        if browser:
+            browser.setUrl(QUrl(url))
 
     def handle_download(self, item):
         path, _ = QFileDialog.getSaveFileName(self, "Save File", item.suggestedFileName())
         if path:
-            item.setDownloadDirectory(os.path.dirname(path))  # PyQt6 API
-            item.setDownloadFileName(os.path.basename(path))  # PyQt6 API
+            item.setDownloadDirectory(os.path.dirname(path))
+            item.setDownloadFileName(os.path.basename(path))
             item.accept()
 
     def closeEvent(self, event):
         self._save_config()
         
-        self.browser.stop()
-        self.browser.load(QUrl("about:blank"))
+        # Close all tabs
+        for i in range(self.tabs.count()):
+            widget = self.tabs.widget(i)
+            if widget:
+                widget.stop()
+                widget.load(QUrl("about:blank"))
+        
         super().closeEvent(event)
 
 
 if __name__ == "__main__":
+    print("[DEBUG] Starting...")  # Added debug print
     try:
+        print("[DEBUG] Creating QApplication...")
         app = QApplication(sys.argv)
+        print("[DEBUG] QApplication created")
         app.setApplicationName("Gorstak's Browser")
+        print("[DEBUG] Creating Browser window...")
         win = Browser()
+        print("[DEBUG] Browser created, showing...")
         win.show()
+        print("[DEBUG] Entering event loop...")
         sys.exit(app.exec())
     except Exception as e:
         print(f"ERROR: {e}")
