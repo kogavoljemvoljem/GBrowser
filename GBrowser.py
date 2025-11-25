@@ -50,7 +50,7 @@ def _clear_stale_locks():
                 shutil.rmtree(cache_dir, ignore_errors=True)
         except:
             pass
-
+    
 # Run cleanup before anything else
 _clear_stale_locks()
 
@@ -963,6 +963,124 @@ class Browser(QMainWindow):
         super().closeEvent(event)
 
 
+class DLLProtection:
+    """Monitors and removes injected DLLs (scans every 5 seconds)"""
+    
+    def __init__(self):
+        self.running = False
+        self.thread = None
+        self.initial_dlls = set()
+        
+        # Whitelist patterns for legitimate lazy-loaded DLLs
+        self.whitelist_patterns = [
+            'python', 'pyqt6', 'qt6', 'site-packages',
+            'windows\\system32', 'windows\\syswow64', 'windows\\winsxs',
+            'nvidia', 'amd', 'intel', 'program files\\common files\\microsoft',
+            'microsoft shared', 'vcruntime', 'msvcp', 'ucrtbase',
+            'directx', 'dotnet', 'windows defender', 'dwmapi',
+            'uxtheme', 'comctl32', 'comdlg32', 'shell32', 'ole32',
+            'tiptsf', 'msctf', 'imm32', 'textinputframework',
+        ]
+    
+    def _get_loaded_dlls(self):
+        """Get set of currently loaded DLL paths"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            psapi = ctypes.WinDLL('psapi')
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            
+            # Set up function signatures
+            psapi.EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            psapi.EnumProcessModules.restype = wintypes.BOOL
+            psapi.GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+            psapi.GetModuleFileNameExW.restype = wintypes.DWORD
+            kernel32.GetCurrentProcess.argtypes = []
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            
+            h_process = kernel32.GetCurrentProcess()
+            h_modules = (wintypes.HMODULE * 1024)()
+            cb_needed = wintypes.DWORD()
+            
+            dlls = set()
+            if psapi.EnumProcessModules(h_process, h_modules, ctypes.sizeof(h_modules), ctypes.byref(cb_needed)):
+                count = cb_needed.value // ctypes.sizeof(wintypes.HMODULE)
+                for i in range(count):
+                    if h_modules[i]:
+                        path_buf = ctypes.create_unicode_buffer(512)
+                        if psapi.GetModuleFileNameExW(h_process, h_modules[i], path_buf, 512):
+                            dlls.add(path_buf.value.lower())
+            return dlls
+        except Exception as e:
+            print(f"[DLL Protection] Error enumerating DLLs: {e}")
+            return set()
+    
+    def _is_whitelisted(self, dll_path):
+        """Check if DLL is in whitelist"""
+        path_lower = dll_path.lower()
+        return any(pattern in path_lower for pattern in self.whitelist_patterns)
+    
+    def _remove_dll(self, dll_path):
+        """Attempt to unload a DLL"""
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            h_module = kernel32.GetModuleHandleW(dll_path)
+            if h_module:
+                for _ in range(10):
+                    if not kernel32.FreeLibrary(h_module):
+                        break
+                return True
+        except:
+            pass
+        return False
+    
+    def _monitor_loop(self):
+        """Main monitoring loop - runs every 5 seconds"""
+        while self.running:
+            try:
+                current_dlls = self._get_loaded_dlls()
+                new_dlls = current_dlls - self.initial_dlls
+                
+                for dll in new_dlls:
+                    if not self._is_whitelisted(dll):
+                        print(f"[DLL Protection] DETECTED: {dll}")
+                        if self._remove_dll(dll):
+                            print(f"[DLL Protection] REMOVED: {dll}")
+                        else:
+                            print(f"[DLL Protection] Failed to remove: {dll}")
+                    else:
+                        # Add whitelisted DLLs to initial set so we don't check them again
+                        self.initial_dlls.add(dll)
+            except Exception as e:
+                print(f"[DLL Protection] Monitor error: {e}")
+            
+            # Sleep for 5 seconds instead of 50ms
+            import time
+            time.sleep(5.0)
+    
+    def start(self):
+        """Start DLL protection"""
+        if self.running:
+            return
+        
+        self.initial_dlls = self._get_loaded_dlls()
+        print(f"[DLL Protection] Captured {len(self.initial_dlls)} baseline DLLs")
+        
+        self.running = True
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+        print("[DLL Protection] Monitoring started (5-second interval)")
+    
+    def stop(self):
+        """Stop DLL protection"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1)
+        print("[DLL Protection] Stopped")
+
+
 class CredentialsManager:
     """Secure credentials storage using Windows DPAPI"""
     
@@ -1127,10 +1245,13 @@ if __name__ == "__main__":
         print("[DEBUG] Browser created, showing...")
         win.show()
         
+        dll_protection = DLLProtection()
+        QTimer.singleShot(2000, dll_protection.start)  # Start after 2 seconds
         
         print("[DEBUG] Entering event loop...")
         exit_code = app.exec()
         
+        dll_protection.stop()
         
         sys.exit(exit_code)
     except Exception as e:
