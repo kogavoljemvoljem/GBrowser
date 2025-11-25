@@ -3,42 +3,54 @@
 import sys
 import ctypes
 from ctypes import wintypes
+import os
+import re
+import json
+import traceback
+import threading
+import time
+from urllib.parse import urlparse
+import shutil # Moved here as it's used early
 
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".gorstak_browser")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+CREDENTIALS_FILE = os.path.join(CONFIG_DIR, "credentials.json")
+
+# DLL Protection - capture baseline at very start before any injections
 _INITIAL_DLLS = set()
-_BASELINE_CAPTURED = False
 
 def _capture_baseline_dlls():
-    """Capture DLLs at the very start before any injections"""
-    global _INITIAL_DLLS, _BASELINE_CAPTURED
-    if sys.platform != 'win32' or _BASELINE_CAPTURED:
+    """Capture all currently loaded DLLs at script start."""
+    global _INITIAL_DLLS
+    if sys.platform != 'win32':
         return
     
     try:
+        psapi = ctypes.WinDLL('psapi')
         kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        psapi = ctypes.WinDLL('psapi', use_last_error=True)
+        
+        GetCurrentProcess = kernel32.GetCurrentProcess
+        GetCurrentProcess.restype = wintypes.HANDLE
         
         EnumProcessModules = psapi.EnumProcessModules
         EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
         EnumProcessModules.restype = wintypes.BOOL
         
-        GetModuleFileNameExW = psapi.GetModuleFileNameExW
-        GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
-        GetModuleFileNameExW.restype = wintypes.DWORD
+        GetModuleFileNameW = kernel32.GetModuleFileNameW
+        GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+        GetModuleFileNameW.restype = wintypes.DWORD
         
-        process_handle = kernel32.GetCurrentProcess()
+        hProcess = GetCurrentProcess()
         hMods = (wintypes.HMODULE * 1024)()
         cbNeeded = wintypes.DWORD()
         
-        if EnumProcessModules(process_handle, hMods, ctypes.sizeof(hMods), ctypes.byref(cbNeeded)):
-            num_modules = cbNeeded.value // ctypes.sizeof(wintypes.HMODULE)
-            for i in range(num_modules):
-                if hMods[i]:
-                    module_name = ctypes.create_unicode_buffer(260)
-                    if GetModuleFileNameExW(process_handle, hMods[i], module_name, 260):
-                        if module_name.value:
-                            _INITIAL_DLLS.add(module_name.value.lower())
+        if EnumProcessModules(hProcess, hMods, ctypes.sizeof(hMods), ctypes.byref(cbNeeded)):
+            count = cbNeeded.value // ctypes.sizeof(wintypes.HMODULE)
+            for i in range(count):
+                name = ctypes.create_unicode_buffer(512)
+                if GetModuleFileNameW(hMods[i], name, 512):
+                    _INITIAL_DLLS.add(name.value.lower())
         
-        _BASELINE_CAPTURED = True
         print(f"[DLL Protection] Captured {len(_INITIAL_DLLS)} baseline DLLs at script start")
     except Exception as e:
         print(f"[DLL Protection] Failed to capture baseline: {e}")
@@ -46,17 +58,47 @@ def _capture_baseline_dlls():
 # Capture immediately!
 _capture_baseline_dlls()
 
+def _clear_stale_locks():
+    """Clear stale lock files and cache that might be left from crashed sessions."""
+    
+    lock_files = [
+        os.path.join(CONFIG_DIR, "storage", "lockfile"),
+        os.path.join(CONFIG_DIR, "cache", "lockfile"),
+        os.path.join(CONFIG_DIR, "storage", "GPUCache", "lockfile"),
+        os.path.join(CONFIG_DIR, "cache", "GPUCache", "lockfile"),
+    ]
+    
+    for lock_file in lock_files:
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+        except:
+            pass
+    
+    cache_dirs = [
+        os.path.join(CONFIG_DIR, "storage", "GPUCache"),
+        os.path.join(CONFIG_DIR, "cache", "GPUCache"),
+        os.path.join(CONFIG_DIR, "storage", "Service Worker"),
+        os.path.join(CONFIG_DIR, "storage", "QuotaManager"),
+        os.path.join(CONFIG_DIR, "storage", "IndexedDB"),
+        os.path.join(CONFIG_DIR, "storage", "Cache"),
+        os.path.join(CONFIG_DIR, "storage", "blob_storage"),
+    ]
+    
+    for cache_dir in cache_dirs:
+        try:
+            if os.path.exists(cache_dir):
+                shutil.rmtree(cache_dir, ignore_errors=True)
+        except:
+            pass
+
+# Run cleanup before anything else
+_clear_stale_locks()
+
+os.makedirs(os.path.join(CONFIG_DIR, "storage"), exist_ok=True)
+os.makedirs(os.path.join(CONFIG_DIR, "cache"), exist_ok=True)
+
 # Now do the rest of the imports
-import os
-import re
-import json
-import traceback
-import threading
-import time
-
-CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".gorstak_browser")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QToolButton, QMenu, QFileDialog,
@@ -209,8 +251,178 @@ class BrowserTab(QWebEngineView):
         self._browser = browser
         page = CustomWebPage(profile, self, browser)
         self.setPage(page)
+        
+        self.loadFinished.connect(self._on_load_finished)
+        self._cred_check_timer = None
+        
         if url:
             self.setUrl(QUrl(url))
+    
+    def _on_load_finished(self, ok):
+        if not ok or not self._browser:
+            return
+        
+        url = self.url().toString().lower()
+        domain = self._browser.credentials_manager.get_domain_from_url(url)
+        creds = self._browser.credentials_manager.get_credentials(domain)
+        
+        if 'discord.com/login' in url or 'discord.com/register' in url:
+            self._inject_discord_credentials(creds)
+            return
+        
+        # Only skip if NOT on a login-related URL
+        is_login_page = any(x in url for x in ['/login', '/signin', '/sign-in', '/auth', '/account/login', '/session', '/sso'])
+        
+        skip_app_domains = ['discord.com', 'discord.gg', 'discordapp.com']
+        for skip in skip_app_domains:
+            if skip in url and not is_login_page:
+                return
+        
+        # Standard credential handling for all other sites including login pages
+        self._inject_standard_credentials(creds)
+    
+    def _inject_discord_credentials(self, creds):
+        """Special credential injection for Discord's React-based login."""
+        # Capture script for Discord - waits for React to render
+        capture_script = """
+        (function() {
+            if (window._gbrowserDiscordCapture) return;
+            window._gbrowserDiscordCapture = true;
+            
+            function captureOnSubmit() {
+                var form = document.querySelector('form');
+                if (!form) return setTimeout(captureOnSubmit, 500);
+                
+                form.addEventListener('submit', function() {
+                    try {
+                        var inputs = document.querySelectorAll('input');
+                        var email = '', pass = '';
+                        inputs.forEach(function(inp) {
+                            if (inp.type === 'email' || inp.name === 'email' || inp.autocomplete === 'email') email = inp.value;
+                            if (inp.type === 'password') pass = inp.value;
+                        });
+                        if (email && pass) window._gbrowserCreds = {username: email, password: pass};
+                    } catch(e) {}
+                }, true);
+            }
+            captureOnSubmit();
+        })();
+        """
+        self.page().runJavaScript(capture_script)
+        
+        # Schedule credential check
+        if self._cred_check_timer:
+            self._cred_check_timer.stop()
+        self._cred_check_timer = QTimer()
+        self._cred_check_timer.setSingleShot(True)
+        self._cred_check_timer.timeout.connect(lambda: self._check_and_save_credentials())
+        self._cred_check_timer.start(3000)
+        
+        # Auto-fill for Discord - wait for React to render inputs
+        if creds:
+            username = creds["username"].replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
+            password = creds["password"].replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
+            
+            fill_script = f"""
+            (function() {{
+                function fillDiscord() {{
+                    var inputs = document.querySelectorAll('input');
+                    var emailInput = null, passInput = null;
+                    
+                    inputs.forEach(function(inp) {{
+                        if (inp.type === 'email' || inp.name === 'email' || inp.autocomplete === 'email') emailInput = inp;
+                        if (inp.type === 'password') passInput = inp;
+                    }});
+                    
+                    if (!emailInput || !passInput) {{
+                        setTimeout(fillDiscord, 500);
+                        return;
+                    }}
+                    
+                    // Simulate real user input for React
+                    function setNativeValue(el, val) {{
+                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(el, val);
+                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }}
+                    
+                    setNativeValue(emailInput, '{username}');
+                    setNativeValue(passInput, '{password}');
+                }}
+                
+                // Wait for Discord's React to render
+                setTimeout(fillDiscord, 1500);
+            }})();
+            """
+            self.page().runJavaScript(fill_script)
+    
+    def _inject_standard_credentials(self, creds):
+        """Standard credential injection for regular websites."""
+        capture_script = """
+        (function() {
+            if (window._gbrowserCredCapture) return;
+            window._gbrowserCredCapture = true;
+            
+            document.addEventListener('submit', function(e) {
+                try {
+                    var form = e.target;
+                    if (form.tagName !== 'FORM') return;
+                    var pass = form.querySelector('input[type="password"]');
+                    if (!pass || !pass.value) return;
+                    var user = form.querySelector('input[type="email"], input[type="text"]');
+                    if (user && user.value) {
+                        window._gbrowserCreds = {username: user.value, password: pass.value};
+                    }
+                } catch(e) {}
+            }, true);
+        })();
+        """
+        self.page().runJavaScript(capture_script)
+        
+        # Schedule credential check
+        if self._cred_check_timer:
+            self._cred_check_timer.stop()
+        self._cred_check_timer = QTimer()
+        self._cred_check_timer.setSingleShot(True)
+        self._cred_check_timer.timeout.connect(lambda: self._check_and_save_credentials())
+        self._cred_check_timer.start(2000)
+        
+        # Auto-fill if we have credentials
+        if creds:
+            username = creds["username"].replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
+            password = creds["password"].replace("\\", "\\\\").replace("'", "\\'").replace("\n", "")
+            
+            fill_script = f"""
+            (function() {{
+                try {{
+                    var pass = document.querySelector('input[type="password"]');
+                    if (!pass) return;
+                    var user = document.querySelector('input[type="email"], input[type="text"]');
+                    if (user) {{
+                        user.value = '{username}';
+                        user.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    }}
+                    pass.value = '{password}';
+                    pass.dispatchEvent(new Event('input', {{bubbles: true}}));
+                }} catch(e) {{}}
+            }})();
+            """
+            self.page().runJavaScript(fill_script)
+    
+    def _check_and_save_credentials(self):
+        if not self._browser:
+            return
+        
+        def handle_result(result):
+            if result and isinstance(result, dict):
+                username = result.get("username", "")
+                password = result.get("password", "")
+                if username and password:
+                    domain = self._browser.credentials_manager.get_domain_from_url(self.url().toString())
+                    self._browser.credentials_manager.save_credentials(domain, username, password)
+        
+        self.page().runJavaScript("window._gbrowserCreds || null", handle_result)
 
 
 class Browser(QMainWindow):
@@ -221,6 +433,9 @@ class Browser(QMainWindow):
         self.setWindowFlags(Qt.WindowType.Window)
 
         self.config = self._load_config()
+        self.bookmarks = self.config.get("bookmarks", [])
+        
+        self.credentials_manager = CredentialsManager()
         
         geom = self.config.get("geometry", {})
         self.setGeometry(
@@ -384,7 +599,6 @@ class Browser(QMainWindow):
         layout.addWidget(self.tabs, 1)
 
         # internal data
-        self.bookmarks = []
         self.overflow_items = []
         self._overflow_timer = QTimer()
         self._overflow_timer.setSingleShot(True)
@@ -493,7 +707,7 @@ class Browser(QMainWindow):
                 json.dump(self.config, f, indent=2)
         except Exception as e:
             print(f"Failed to save config: {e}")
-
+    
     # ------------------------
     # Bookmarks file handling
     # ------------------------
@@ -790,8 +1004,9 @@ class Browser(QMainWindow):
                 widget.stop()
                 widget.load(QUrl("about:blank"))
         
-        # Stop DLL protection
-        self.dll_protection.stop()
+        # Close DLL protection
+        if hasattr(self, 'dll_protection') and self.dll_protection:
+            self.dll_protection.stop()
         
         super().closeEvent(event)
 
@@ -929,7 +1144,88 @@ class DLLProtection:
     def stop(self):
         """Stop the monitoring thread"""
         self.running = False
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=1) # Give it a moment to finish
         print("[DLL Protection] Stopped")
+
+
+class CredentialsManager:
+    """Simple encrypted credentials storage"""
+    
+    def __init__(self):
+        self.credentials = {}
+        self._load()
+    
+    def _get_key(self):
+        """Generate a simple obfuscation key based on machine ID"""
+        import hashlib
+        machine_id = os.environ.get('COMPUTERNAME', '') + os.environ.get('USERNAME', '')
+        return hashlib.sha256(machine_id.encode()).digest()
+    
+    def _obfuscate(self, text):
+        """Simple XOR obfuscation - not true encryption but deters casual snooping"""
+        import base64
+        key = self._get_key()
+        result = bytearray()
+        for i, char in enumerate(text.encode('utf-8')):
+            result.append(char ^ key[i % len(key)])
+        return base64.b64encode(result).decode('ascii')
+    
+    def _deobfuscate(self, text):
+        """Reverse the obfuscation"""
+        import base64
+        key = self._get_key()
+        data = base64.b64decode(text.encode('ascii'))
+        result = bytearray()
+        for i, byte in enumerate(data):
+            result.append(byte ^ key[i % len(key)])
+        return result.decode('utf-8')
+    
+    def _load(self):
+        """Load credentials from file"""
+        if not os.path.exists(CREDENTIALS_FILE):
+            return
+        try:
+            with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for domain, creds in data.items():
+                    self.credentials[domain] = {
+                        'username': self._deobfuscate(creds['username']),
+                        'password': self._deobfuscate(creds['password'])
+                    }
+        except Exception as e:
+            print(f"[Credentials] Failed to load: {e}")
+    
+    def _save(self):
+        """Save credentials to file"""
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        try:
+            data = {}
+            for domain, creds in self.credentials.items():
+                data[domain] = {
+                    'username': self._obfuscate(creds['username']),
+                    'password': self._obfuscate(creds['password'])
+                }
+            with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[Credentials] Failed to save: {e}")
+    
+    def save_credentials(self, domain, username, password):
+        """Save credentials for a domain"""
+        if username and password:
+            self.credentials[domain] = {'username': username, 'password': password}
+            self._save()
+            print(f"[Credentials] Saved for {domain}")
+    
+    def get_credentials(self, domain):
+        """Get credentials for a domain"""
+        return self.credentials.get(domain)
+    
+    def get_domain_from_url(self, url):
+        """Extract domain from URL"""
+        parsed = urlparse(url)
+        return parsed.netloc.lower()
 
 
 _dll_protection = None
@@ -938,8 +1234,9 @@ _dll_protection = None
 if __name__ == "__main__":
     print("[DEBUG] Starting...")
     try:
+        # Ensure DLLProtection is initialized only on Windows
         if sys.platform == 'win32':
-            print("[DEBUG] Creating DLL protection...")
+            print("[DEBUG] Creating DLL protection instance...")
             _dll_protection = DLLProtection()
         
         print("[DEBUG] Creating QApplication...")
