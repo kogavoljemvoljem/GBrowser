@@ -1,38 +1,61 @@
 # Gorstak's Browser - PyQt6 with tabs, video support, and fixed bookmarks
-import os
+
 import sys
+import ctypes
+from ctypes import wintypes
+
+_INITIAL_DLLS = set()
+_BASELINE_CAPTURED = False
+
+def _capture_baseline_dlls():
+    """Capture DLLs at the very start before any injections"""
+    global _INITIAL_DLLS, _BASELINE_CAPTURED
+    if sys.platform != 'win32' or _BASELINE_CAPTURED:
+        return
+    
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        psapi = ctypes.WinDLL('psapi', use_last_error=True)
+        
+        EnumProcessModules = psapi.EnumProcessModules
+        EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        EnumProcessModules.restype = wintypes.BOOL
+        
+        GetModuleFileNameExW = psapi.GetModuleFileNameExW
+        GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+        GetModuleFileNameExW.restype = wintypes.DWORD
+        
+        process_handle = kernel32.GetCurrentProcess()
+        hMods = (wintypes.HMODULE * 1024)()
+        cbNeeded = wintypes.DWORD()
+        
+        if EnumProcessModules(process_handle, hMods, ctypes.sizeof(hMods), ctypes.byref(cbNeeded)):
+            num_modules = cbNeeded.value // ctypes.sizeof(wintypes.HMODULE)
+            for i in range(num_modules):
+                if hMods[i]:
+                    module_name = ctypes.create_unicode_buffer(260)
+                    if GetModuleFileNameExW(process_handle, hMods[i], module_name, 260):
+                        if module_name.value:
+                            _INITIAL_DLLS.add(module_name.value.lower())
+        
+        _BASELINE_CAPTURED = True
+        print(f"[DLL Protection] Captured {len(_INITIAL_DLLS)} baseline DLLs at script start")
+    except Exception as e:
+        print(f"[DLL Protection] Failed to capture baseline: {e}")
+
+# Capture immediately!
+_capture_baseline_dlls()
+
+# Now do the rest of the imports
+import os
 import re
 import json
 import traceback
+import threading
+import time
 
-# Config file path for persistence
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".gorstak_browser")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-
-os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
-os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-    "--no-sandbox "
-    "--enable-accelerated-2d-canvas "
-    "--enable-gpu-rasterization "
-    "--enable-webgl "
-    "--enable-webgl2 "
-    "--ignore-gpu-blocklist "
-    "--autoplay-policy=no-user-gesture-required "
-    # Video codec support
-    "--enable-accelerated-video-decode "
-    "--enable-accelerated-video-encode "
-    "--enable-gpu-memory-buffer-video-frames "
-    "--enable-native-gpu-memory-buffers "
-    "--disable-webrtc-multiple-routes "
-    "--disable-webrtc-hw-encoding "
-    "--disable-webrtc-hw-decoding "
-    "--enforce-webrtc-ip-permission-check "
-    "--webrtc-ip-handling-policy=disable_non_proxied_udp "
-    "--disable-background-networking "
-    "--disable-client-side-phishing-detection "
-    "--no-pings "
-    "--disable-domain-reliability "
-)
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -372,6 +395,9 @@ class Browser(QMainWindow):
         if saved_bookmarks:
             self.bookmarks = saved_bookmarks
             self._rebuild_bookmarks_bar()
+
+        # Initialize DLL protection
+        self.dll_protection = DLLProtection()
 
     def _add_tab(self, url="https://www.google.com"):
         tab = BrowserTab(self.profile, self, url)
@@ -764,12 +790,158 @@ class Browser(QMainWindow):
                 widget.stop()
                 widget.load(QUrl("about:blank"))
         
+        # Stop DLL protection
+        self.dll_protection.stop()
+        
         super().closeEvent(event)
 
 
+class DLLProtection:
+    """Aggressively removes ANY DLL injected after script start"""
+    
+    # Whitelist patterns for Qt/Python lazy-loaded DLLs only
+    ALLOWED_PATHS = (
+        "\\python",
+        "\\pyqt6",
+        "\\qt6",
+        "\\windows\\system32",
+        "\\windows\\syswow64",
+        "\\windows\\winsxs",
+        "\\nvidia",
+        "\\amd",
+        "\\intel",
+        "\\program files\\common files\\microsoft",
+        "\\program files (x86)\\common files\\microsoft",
+        "\\program files\\windows",
+        "\\program files (x86)\\windows",
+        "\\microsoft.vc",
+        "\\vcruntime",
+        "\\msvcp",
+        "\\msvcr",
+        "\\directx",
+        "\\microsoft shared",
+        "\\shell",
+        "\\microsoft.net",
+        "\\dotnet",
+        "\\windows defender",
+        "\\programdata\\microsoft",
+    )
+    
+    def __init__(self):
+        self.running = False
+        self.check_interval = 0.05  # 50ms
+        self.monitor_thread = None
+        # Use the baseline captured at script start
+        self.initial_dlls = set(_INITIAL_DLLS)
+        print(f"[DLL Protection] Initialized with {len(self.initial_dlls)} baseline DLLs")
+    
+    def start(self):
+        """Start monitoring for injected DLLs"""
+        if self.running:
+            return
+        self.running = True
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.monitor_thread.start()
+        print("[DLL Protection] Monitoring started - will remove injected DLLs")
+    
+    def _is_allowed_lazy_dll(self, path):
+        """Check if this DLL is allowed to load after startup (Qt/Python/System)"""
+        path_lower = path.lower()
+        for allowed in self.ALLOWED_PATHS:
+            if allowed in path_lower:
+                return True
+        return False
+    
+    def _get_loaded_dlls(self):
+        """Get list of currently loaded DLLs"""
+        dlls = []
+        try:
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            psapi = ctypes.WinDLL('psapi', use_last_error=True)
+            
+            EnumProcessModules = psapi.EnumProcessModules
+            EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            EnumProcessModules.restype = wintypes.BOOL
+            
+            GetModuleFileNameExW = psapi.GetModuleFileNameExW
+            GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+            GetModuleFileNameExW.restype = wintypes.DWORD
+            
+            process_handle = kernel32.GetCurrentProcess()
+            hMods = (wintypes.HMODULE * 1024)()
+            cbNeeded = wintypes.DWORD()
+            
+            if EnumProcessModules(process_handle, hMods, ctypes.sizeof(hMods), ctypes.byref(cbNeeded)):
+                num_modules = cbNeeded.value // ctypes.sizeof(wintypes.HMODULE)
+                for i in range(num_modules):
+                    if hMods[i]:
+                        module_name = ctypes.create_unicode_buffer(260)
+                        if GetModuleFileNameExW(process_handle, hMods[i], module_name, 260):
+                            if module_name.value:
+                                dlls.append((hMods[i], module_name.value))
+        except Exception as e:
+            pass
+        return dlls
+    
+    def _unload_dll(self, handle, path):
+        """Forcefully unload an injected DLL"""
+        try:
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            FreeLibrary = kernel32.FreeLibrary
+            FreeLibrary.argtypes = [wintypes.HMODULE]
+            FreeLibrary.restype = wintypes.BOOL
+            
+            for _ in range(20):
+                if not FreeLibrary(handle):
+                    break
+            print(f"[DLL Protection] REMOVED: {path}")
+            return True
+        except Exception as e:
+            print(f"[DLL Protection] Failed to remove {path}: {e}")
+        return False
+    
+    def _monitor_loop(self):
+        """Background thread that removes injected DLLs"""
+        while self.running:
+            try:
+                time.sleep(self.check_interval)
+                
+                for handle, path in self._get_loaded_dlls():
+                    path_lower = path.lower()
+                    
+                    # Skip if it was in baseline
+                    if path_lower in self.initial_dlls:
+                        continue
+                    
+                    # Allow Qt/Python/System DLLs to load lazily
+                    if self._is_allowed_lazy_dll(path):
+                        self.initial_dlls.add(path_lower)
+                        continue
+                    
+                    # Remove everything else
+                    print(f"[DLL Protection] DETECTED INJECTION: {path}")
+                    self._unload_dll(handle, path)
+                    self.initial_dlls.add(path_lower)  # Don't spam
+                    
+            except Exception:
+                pass
+    
+    def stop(self):
+        """Stop the monitoring thread"""
+        self.running = False
+        print("[DLL Protection] Stopped")
+
+
+_dll_protection = None
+
+
 if __name__ == "__main__":
-    print("[DEBUG] Starting...")  # Added debug print
+    print("[DEBUG] Starting...")
     try:
+        if sys.platform == 'win32':
+            print("[DEBUG] Creating DLL protection...")
+            _dll_protection = DLLProtection()
+        
         print("[DEBUG] Creating QApplication...")
         app = QApplication(sys.argv)
         print("[DEBUG] QApplication created")
@@ -778,8 +950,18 @@ if __name__ == "__main__":
         win = Browser()
         print("[DEBUG] Browser created, showing...")
         win.show()
+        
+        if _dll_protection:
+            print("[DEBUG] Starting DLL protection monitoring...")
+            _dll_protection.start()
+        
         print("[DEBUG] Entering event loop...")
-        sys.exit(app.exec())
+        exit_code = app.exec()
+        
+        if _dll_protection:
+            _dll_protection.stop()
+        
+        sys.exit(exit_code)
     except Exception as e:
         print(f"ERROR: {e}")
         traceback.print_exc()
